@@ -1,0 +1,8 @@
+# Hashed build output never changes under the same name
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+
+# Background frame sequence: served from the browser cache on reload instead of
+# re-validating all 300 frames; a rebuilt sequence reaches visitors within a day.
+/sequence/*
+  Cache-Control: public, max-age=86400, stale-while-revalidate=2592000

@@ -19,11 +19,10 @@ const BASE = (import.meta.env.BASE_URL || './').endsWith('/')
 // Two frame sets, built by scripts/build_sequence.cjs:
 // - desktop: full 1280x720 frames, AVIF q45 (~26 KB/frame)
 // - mobile:  the centre 405x720 strip, JPEG (~18 KB/frame). With cover-fit a portrait
-//   screen only ever shows that strip, and JPEG re-decodes far faster than AVIF when a
-//   phone evicts decoded frames mid-scroll.
+//   screen only ever shows that strip, and JPEG decodes far faster than AVIF on phones.
 const FRAME_SETS = {
-  desktop: { dir: 'desktop', ext: 'avif' },
-  mobile: { dir: 'mobile', ext: 'jpg' },
+  desktop: { dir: 'desktop', ext: 'avif', width: 1280, height: 720 },
+  mobile: { dir: 'mobile', ext: 'jpg', width: 405, height: 720 },
 }
 
 // The strip is 405/720 = 0.5625 wide; up to ~0.6 it still covers the screen with only a
@@ -35,192 +34,258 @@ const getFrameUrl = (set, frameIndex) => {
   return `${BASE}sequence/${dir}/frame-${String(frameIndex).padStart(3, '0')}.${ext}`
 }
 
-// Persistent module-level caches (one per set) so React StrictMode doesn't discard loaded images
-const imageCaches = {
+// Download order. Every KEYFRAME_STRIDE-th frame is pulled forward (it counts as being
+// KEYFRAME_BOOST times closer), so on a slow connection the whole scroll range gets coarse
+// coverage early and the background keeps moving instead of freezing on the last frame
+// that arrived; the gaps fill in around the viewer afterwards.
+const KEYFRAME_STRIDE = 16
+const KEYFRAME_BOOST = 8
+const MAX_PARALLEL_FETCHES = 6
+
+// Decoded frames are kept as ImageBitmaps only around the current position (plus the
+// keyframes). Holding all 300 decoded (~1.1 GB on desktop) made the browser evict them
+// and re-decode AVIF synchronously inside drawImage while scrolling: the stutter.
+// createImageBitmap decodes off the main thread, so drawing a bitmap never blocks.
+const DECODE_AHEAD = 18
+const DECODE_BEHIND = 8
+const MAX_PARALLEL_DECODES = 4
+
+// Compressed frames, per set, kept across StrictMode remounts (~8 MB for a whole set)
+const blobCaches = {
   desktop: new Array(TOTAL_FRAMES),
   mobile: new Array(TOTAL_FRAMES),
 }
 
+const isKeyframe = (i) => i % KEYFRAME_STRIDE === 0
+
 export default function CanvasAnimation({ scrollContainerRef }) {
   const wrapperRef = useRef(null)
   const canvasRef = useRef(null)
-  const imagesRef = useRef(imageCaches.desktop)
-  const frameObj = useRef({ frame: 1 })
-  const lastRenderedFrame = useRef(-1)
-  // Index actually painted on the canvas (may be a nearby stand-in while the target loads)
-  const shownFrame = useRef(-1)
 
   useEffect(() => {
     let isCancelled = false
     let activeSet = pickFrameSet()
-    imagesRef.current = imageCaches[activeSet]
-    // Frames already requested per set in this run (loaded, in flight or failed)
+    // Current scroll position in frames (1-based, fractional)
+    let currentFrame = 1
+    // Index painted on the canvas (may be a nearby stand-in while the target loads)
+    let shownIdx = -1
+    let shownExact = false
+
+    // Frames requested from the network per set (loaded, in flight or failed)
     const requestedBySet = { desktop: new Set(), mobile: new Set() }
+    let fetchesInFlight = 0
 
-    const drawCoverImage = (ctx, canvas, img) => {
-      if (!img) return
-      const nw = img.naturalWidth || img.width
-      const nh = img.naturalHeight || img.height
-      if (!nw || !nh) return
+    // Decoded frames for the active set only
+    let bitmaps = new Map()
+    let decoding = new Set()
+    let decodesInFlight = 0
 
+    const targetIdx = () => Math.min(Math.max(Math.round(currentFrame) - 1, 0), TOTAL_FRAMES - 1)
+
+    const getContext = () => canvasRef.current?.getContext('2d', { alpha: false }) || null
+
+    const drawCover = (bitmap) => {
+      const canvas = canvasRef.current
+      const ctx = getContext()
+      if (!canvas || !ctx) return
       const cw = canvas.width
       const ch = canvas.height
       if (cw <= 0 || ch <= 0) return
-
-      const imgRatio = nw / nh
-      const canvasRatio = cw / ch
-
-      let drawW, drawH, drawX, drawY
-
-      if (canvasRatio > imgRatio) {
-        drawW = cw
-        drawH = cw / imgRatio
-        drawX = 0
-        drawY = (ch - drawH) / 2
-      } else {
-        drawH = ch
-        drawW = ch * imgRatio
-        drawX = (cw - drawW) / 2
-        drawY = 0
-      }
-
-      ctx.drawImage(img, drawX, drawY, drawW, drawH)
+      const scale = Math.max(cw / bitmap.width, ch / bitmap.height)
+      const w = bitmap.width * scale
+      const h = bitmap.height * scale
+      ctx.drawImage(bitmap, (cw - w) / 2, (ch - h) / 2, w, h)
     }
 
-    const renderCurrentFrame = (frameNum) => {
-      const canvas = canvasRef.current
-      if (!canvas) return
-      // { alpha: false } provides direct hardware overlay composite for maximum GPU fillrate
-      const ctx = canvas.getContext('2d', { alpha: false })
-      if (!ctx) return
-
-      const idx = Math.min(Math.max(Math.round(frameNum) - 1, 0), TOTAL_FRAMES - 1)
-
-      // Guard: skip repaint if frame hasn't changed (saves 70% of draw calls on scroll)
-      if (idx === lastRenderedFrame.current) return
-
-      const img = imagesRef.current[idx]
-
-      if (img) {
-        drawCoverImage(ctx, canvas, img)
-        lastRenderedFrame.current = idx
-        shownFrame.current = idx
+    const render = () => {
+      const idx = targetIdx()
+      const exact = bitmaps.get(idx)
+      if (exact) {
+        if (shownIdx === idx && shownExact) return
+        drawCover(exact)
+        shownIdx = idx
+        shownExact = true
         return
       }
+      // Nearest decoded frame as a stand-in until the target is ready
+      let nearest = -1
+      let best = Infinity
+      for (const i of bitmaps.keys()) {
+        const d = Math.abs(i - idx)
+        if (d < best) {
+          best = d
+          nearest = i
+        }
+      }
+      if (nearest !== -1 && nearest !== shownIdx) {
+        drawCover(bitmaps.get(nearest))
+        shownIdx = nearest
+        shownExact = false
+      }
+    }
 
-      // Fallback to the nearest loaded frame while the target is still downloading
-      let nearestIdx = -1
-      let minDistance = Infinity
+    // --- Decoding window -------------------------------------------------------------
 
-      for (let i = 0; i < TOTAL_FRAMES; i++) {
-        if (imagesRef.current[i]) {
-          const dist = Math.abs(i - idx)
-          if (dist < minDistance) {
-            minDistance = dist
-            nearestIdx = i
-          }
+    const wantsBitmap = (i, target) =>
+      isKeyframe(i) || (i >= target - DECODE_BEHIND && i <= target + DECODE_AHEAD)
+
+    const updateDecodes = () => {
+      if (isCancelled) return
+      const target = targetIdx()
+      const blobs = blobCaches[activeSet]
+
+      // Free decoded frames that fell out of the window
+      for (const [i, bitmap] of bitmaps) {
+        if (!wantsBitmap(i, target)) {
+          bitmap.close()
+          bitmaps.delete(i)
         }
       }
 
-      if (nearestIdx !== -1 && nearestIdx !== shownFrame.current) {
-        drawCoverImage(ctx, canvas, imagesRef.current[nearestIdx])
-        shownFrame.current = nearestIdx
-        // Note: Do NOT set lastRenderedFrame.current = idx here,
-        // so that when idx finishes downloading, it draws immediately!
+      // Decode the closest missing frames first (ahead before behind)
+      const order = [target]
+      for (let d = 1; d <= DECODE_AHEAD; d++) {
+        order.push(target + d)
+        if (d <= DECODE_BEHIND) order.push(target - d)
+      }
+      for (const i of order) {
+        if (decodesInFlight >= MAX_PARALLEL_DECODES) return
+        if (i < 0 || i >= TOTAL_FRAMES) continue
+        if (blobs[i] && !bitmaps.has(i) && !decoding.has(i)) decode(i)
+      }
+      // Keyframes anywhere on the page, nearest first
+      const keys = []
+      for (let i = 0; i < TOTAL_FRAMES; i += KEYFRAME_STRIDE) {
+        if (blobs[i] && !bitmaps.has(i) && !decoding.has(i)) keys.push(i)
+      }
+      keys.sort((a, b) => Math.abs(a - target) - Math.abs(b - target))
+      for (const i of keys) {
+        if (decodesInFlight >= MAX_PARALLEL_DECODES) return
+        decode(i)
       }
     }
+
+    const decode = (i) => {
+      const set = activeSet
+      const setBitmaps = bitmaps
+      const setDecoding = decoding
+      setDecoding.add(i)
+      decodesInFlight++
+      createImageBitmap(blobCaches[set][i])
+        .then((bitmap) => {
+          // Discard if the set switched or the viewer has moved on meanwhile
+          if (isCancelled || set !== activeSet || !wantsBitmap(i, targetIdx())) {
+            bitmap.close()
+            return
+          }
+          setBitmaps.set(i, bitmap)
+          render()
+        })
+        .catch(() => {
+          // Undecodable frame: drop the bytes so it is not retried in a loop
+          blobCaches[set][i] = undefined
+        })
+        .finally(() => {
+          setDecoding.delete(i)
+          decodesInFlight--
+          updateDecodes()
+        })
+    }
+
+    // --- Network ---------------------------------------------------------------------
+
+    const nextFrameToFetch = () => {
+      const target = targetIdx()
+      const blobs = blobCaches[activeSet]
+      const requested = requestedBySet[activeSet]
+      let pick = -1
+      let bestScore = Infinity
+      for (let i = 0; i < TOTAL_FRAMES; i++) {
+        if (blobs[i] || requested.has(i)) continue
+        // Viewers mostly scroll down: frames behind count double
+        let score = i >= target ? i - target : (target - i) * 2
+        if (isKeyframe(i)) score /= KEYFRAME_BOOST
+        if (score < bestScore) {
+          bestScore = score
+          pick = i
+        }
+      }
+      return pick
+    }
+
+    const pumpFetches = () => {
+      while (!isCancelled && fetchesInFlight < MAX_PARALLEL_FETCHES) {
+        const i = nextFrameToFetch()
+        if (i === -1) return
+        const set = activeSet
+        requestedBySet[set].add(i)
+        fetchesInFlight++
+        fetch(getFrameUrl(set, i + 1), { priority: i === targetIdx() ? 'high' : 'auto' })
+          .then((res) => (res.ok ? res.blob() : null))
+          .catch(() => null)
+          .then((blob) => {
+            fetchesInFlight--
+            if (blob) blobCaches[set][i] = blob
+            if (isCancelled) return
+            if (blob && set === activeSet) updateDecodes()
+            pumpFetches()
+          })
+      }
+    }
+
+    // Start from whatever this set already has in memory (StrictMode remount, set switch)
+    const resetSet = () => {
+      for (const bitmap of bitmaps.values()) bitmap.close()
+      bitmaps = new Map()
+      decoding = new Set()
+      shownIdx = -1
+      shownExact = false
+    }
+
+    // --- Canvas size -----------------------------------------------------------------
 
     // The wrapper is sized in lvh (largest viewport), so it does not change when the mobile
     // address bar collapses mid-scroll. Resizing the canvas clears it, and doing that on every
     // toolbar change made the background flash and stutter while scrolling on phones.
+    //
+    // The backing store never exceeds the frame's own resolution: on a 2x display a
+    // full-DPR canvas was 4K for 720p footage, drawing four times the pixels for no extra
+    // detail. CSS stretches the canvas to the screen instead.
     const handleResize = () => {
       const canvas = canvasRef.current
       const wrapper = wrapperRef.current
       if (!canvas || !wrapper) return
-      const dpr = Math.min(window.devicePixelRatio || 1, 2)
-      const nextW = Math.round(wrapper.clientWidth * dpr)
-      const nextH = Math.round(wrapper.clientHeight * dpr)
-      // Rotating a phone or resizing a window can cross the portrait threshold: switch sets
       const nextSet = pickFrameSet()
       const setChanged = nextSet !== activeSet
       if (setChanged) {
         activeSet = nextSet
-        imagesRef.current = imageCaches[activeSet]
+        resetSet()
       }
-      if (canvas.width === nextW && canvas.height === nextH && !setChanged) return
-      canvas.width = nextW
-      canvas.height = nextH
-      lastRenderedFrame.current = -1 // Force redraw on resize
-      shownFrame.current = -1
-      renderCurrentFrame(frameObj.current.frame)
-      if (setChanged) pump()
+      const { width: fw, height: fh } = FRAME_SETS[activeSet]
+      const cssW = wrapper.clientWidth
+      const cssH = wrapper.clientHeight
+      if (!cssW || !cssH) return
+      const dpr = Math.min(window.devicePixelRatio || 1, 2)
+      const coverScale = Math.max(cssW / fw, cssH / fh)
+      const k = Math.min(dpr, 1 / coverScale)
+      const nextW = Math.round(cssW * k)
+      const nextH = Math.round(cssH * k)
+      if (canvas.width !== nextW || canvas.height !== nextH) {
+        canvas.width = nextW
+        canvas.height = nextH
+        shownIdx = -1 // resizing cleared the canvas
+      }
+      if (setChanged) {
+        updateDecodes()
+        pumpFetches()
+      }
+      render()
     }
 
     window.addEventListener('resize', handleResize, { passive: true })
     handleResize()
 
-    // Scroll-aware loader: a small pool of parallel requests, always picking the missing
-    // frame closest to where the viewer currently is. Firing all 300 requests at once made
-    // slow (mobile) connections fetch frames in file order, so after the hero the background
-    // froze on the last loaded frame until the whole sequence arrived.
-    const MAX_PARALLEL = 8
-    let inFlight = 0
-
-    const nextFrameToLoad = () => {
-      const target = Math.min(Math.max(Math.round(frameObj.current.frame) - 1, 0), TOTAL_FRAMES - 1)
-      const cache = imageCaches[activeSet]
-      const requested = requestedBySet[activeSet]
-      const isMissing = (i) => !cache[i] && !requested.has(i)
-      for (let d = 0; d < TOTAL_FRAMES; d++) {
-        // Look further ahead than behind: viewers mostly scroll down
-        const ahead = target + d
-        if (ahead < TOTAL_FRAMES && isMissing(ahead)) return ahead
-        const behind = target - Math.ceil(d / 2)
-        if (behind >= 0 && isMissing(behind)) return behind
-      }
-      return -1
-    }
-
-    const pump = () => {
-      while (!isCancelled && inFlight < MAX_PARALLEL) {
-        const idx = nextFrameToLoad()
-        if (idx === -1) return
-        const set = activeSet
-        requestedBySet[set].add(idx)
-        inFlight++
-
-        const img = new Image()
-        img.src = getFrameUrl(set, idx + 1)
-
-        const done = (ok) => {
-          inFlight--
-          if (ok) imageCaches[set][idx] = img
-          if (isCancelled) return
-          // Repaint if this frame is a better match than what is on screen now
-          const target = Math.round(frameObj.current.frame) - 1
-          if (ok && set === activeSet && Math.abs(idx - target) < Math.abs(shownFrame.current - target)) {
-            lastRenderedFrame.current = -1
-            renderCurrentFrame(frameObj.current.frame)
-          }
-          pump()
-        }
-        // decode() finishes AVIF decoding off the main thread before the frame is used,
-        // so drawImage during scroll never stalls on a first-time decode (visible hitching)
-        // A browser may hold decode() while the page is not being painted (background tab,
-        // hidden webview); never let that stall the queue: after the bytes arrive, wait for
-        // the decode at most 300 ms and carry on either way.
-        const loaded = new Promise((resolve) => {
-          img.onload = () => resolve(true)
-          img.onerror = () => resolve(false)
-        })
-        loaded
-          .then((ok) => ok && Promise.race([
-            img.decode().then(() => true, () => true),
-            new Promise((resolve) => setTimeout(() => resolve(true), 300)),
-          ]))
-          .then(done)
-      }
-    }
+    // --- Scroll ----------------------------------------------------------------------
 
     // Share of total scroll at which the hero's sticky fly-through ends (hero bottom meets
     // viewport bottom, the same point App's hero timeline finishes). Re-measured on refresh.
@@ -238,10 +303,16 @@ export default function CanvasAnimation({ scrollContainerRef }) {
       return HERO_END_FRAME + ((p - heroEnd) / (1 - heroEnd)) * (TOTAL_FRAMES - HERO_END_FRAME)
     }
 
+    let lastWindowTarget = -1
     const syncToScroll = (self) => {
-      const targetFrame = progressToFrame(self.progress)
-      frameObj.current.frame = targetFrame
-      renderCurrentFrame(targetFrame)
+      currentFrame = progressToFrame(self.progress)
+      render()
+      // Slide the decode window only when the target frame actually changes
+      const target = targetIdx()
+      if (target !== lastWindowTarget) {
+        lastWindowTarget = target
+        updateDecodes()
+      }
     }
 
     const trigger = ScrollTrigger.create({
@@ -256,15 +327,17 @@ export default function CanvasAnimation({ scrollContainerRef }) {
       onUpdate: syncToScroll,
     })
     measureHeroEnd(trigger)
-    frameObj.current.frame = progressToFrame(trigger.progress)
+    currentFrame = progressToFrame(trigger.progress)
 
     // Start loading around the current position (after a reload mid-page too)
-    pump()
+    updateDecodes()
+    pumpFetches()
 
     return () => {
       isCancelled = true
       window.removeEventListener('resize', handleResize)
       trigger.kill()
+      for (const bitmap of bitmaps.values()) bitmap.close()
     }
   }, [scrollContainerRef])
 
