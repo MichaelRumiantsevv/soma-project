@@ -41,6 +41,7 @@ const getFrameUrl = (set, frameIndex) => {
 const KEYFRAME_STRIDE = 16
 const KEYFRAME_BOOST = 8
 const MAX_PARALLEL_FETCHES = 6
+const MAX_FETCH_RETRIES = 3
 
 // Decoded frames are kept as ImageBitmaps only around the current position (plus the
 // keyframes). Holding all 300 decoded (~1.1 GB on desktop) made the browser evict them
@@ -73,6 +74,7 @@ export default function CanvasAnimation({ scrollContainerRef }) {
 
     // Frames requested from the network per set (loaded, in flight or failed)
     const requestedBySet = { desktop: new Set(), mobile: new Set() }
+    const failedAttempts = new Map()
     let fetchesInFlight = 0
 
     // Decoded frames for the active set only
@@ -227,6 +229,19 @@ export default function CanvasAnimation({ scrollContainerRef }) {
             fetchesInFlight--
             if (blob) blobCaches[set][i] = blob
             if (isCancelled) return
+            // Transient errors (a 503 from the host, a dropped connection): put the frame
+            // back in the queue after a pause instead of leaving a permanent gap
+            if (!blob) {
+              const attempts = (failedAttempts.get(`${set}:${i}`) || 0) + 1
+              failedAttempts.set(`${set}:${i}`, attempts)
+              if (attempts <= MAX_FETCH_RETRIES) {
+                setTimeout(() => {
+                  if (isCancelled) return
+                  requestedBySet[set].delete(i)
+                  pumpFetches()
+                }, 1000 * attempts)
+              }
+            }
             if (blob && set === activeSet) updateDecodes()
             pumpFetches()
           })
