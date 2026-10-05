@@ -22,3 +22,19 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Large files & temp folders
+*.zip
+temp_png/
+moodboard/
+archive/
+errors.mp4
+errors/
+dist/
+
+# Local tooling / design notes (not needed for Cloudflare Pages build)
+.claude/
+.impeccable/
+scripts/
+PRODUCT.md
+.oxlintrc.json
