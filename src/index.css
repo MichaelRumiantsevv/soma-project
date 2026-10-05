@@ -47,12 +47,14 @@
 
   /* Lavender glass for every card on the page: the sequence is a bright pastel world, so
      cards are a tinted, airy veil of it rather than dark slabs. White text keeps a soft
-     plum shadow so it still separates from the brightest cloud frames. */
-  --card-glass: rgba(120, 100, 150, 0.35);
-  --card-glass-solid: rgba(110, 92, 140, 0.55); /* no-blur variant (phones, heavy sections) */
-  --card-blur: blur(20px) saturate(140%);
+     plum shadow so it still separates from the brightest cloud frames.
+     The heavy blur turns the clouds behind a card into a soft wash, so the text sits on
+     an even tone instead of competing with cloud edges. */
+  --card-glass: rgba(100, 82, 132, 0.5);
+  --card-glass-solid: rgba(92, 76, 122, 0.78); /* no-blur variant (phones, heavy sections) */
+  --card-blur: blur(44px) saturate(140%);
   --card-border: rgba(255, 255, 255, 0.2);
-  --card-tile: rgba(255, 255, 255, 0.05);
+  --card-tile: rgba(255, 255, 255, 0.07);
   --card-tile-strong: rgba(255, 255, 255, 0.15);
   --card-text-shadow: 0 1px 14px rgba(40, 20, 60, 0.45);
 }
